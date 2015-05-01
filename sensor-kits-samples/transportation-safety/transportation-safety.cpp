@@ -54,7 +54,7 @@
 
 using namespace std;
 
-volatile bool shouldRun = true;
+static volatile bool shouldRun = true;
 const size_t bufferLength = 256;
 static volatile bool g_displayTime = true;
 UdpClient client;
@@ -63,15 +63,21 @@ UdpClient client;
  * Interrupt handler to catch the SIGING signal, ctrl-c
  * From command line only
  */
-void sig_handler(int signo)
-{
-	if (signo == SIGINT)
-	{
+void sig_handler(int signo) {
+	if (signo == SIGINT) {
 		shouldRun = false;
 		cout << "Exiting..." << endl;
 		cout << "Please wait up to 10secs for threads to finish." << endl;
 	}
 }
+
+/**
+ * @brief struct to hold latitude and longitude data
+ */
+struct gpsCoords {
+	float latitude;
+	float longitude;
+};
 
 /**
  * @brief Write data to the cloud
@@ -120,15 +126,20 @@ vector<string> split(const string &str, char delimiter) {
 
 /**
  * @brief Convert the coordinates to degrees
- * @return a float value representing degrees
+ *              (deg)mm.ssss ->      (deg).(fraction of degree)
+ * example: input: 4532.5103 -> output: 45.2345
+ * @return a float value representing degrees.fractionOfDegrees
  */
-float convertRawCoords(string rawCoord, string cardinalDirection) {
-	string::size_type sz;
+float convertRawCoords(float rawCoord, string cardinalDirection) {
 	float ret = 0.0f;
 	float direction = 1;
 
-	/* If the incoming coordinate is empty, exit */
-	if (rawCoord.empty())
+	/* If the incoming coordinate is about zero, exit */
+	if (rawCoord < 0.0000001f)
+		return 0;
+
+	/* If the cardinal direction does not contain valid data, exit */
+	if(cardinalDirection.empty())
 		return 0;
 
 	/* If direction is either South or West, coordinate needs to be negative */
@@ -136,15 +147,14 @@ float convertRawCoords(string rawCoord, string cardinalDirection) {
 		direction = -1;
 
 	/* Get degrees, eg: rawCoord = 4532.5103 => 45 */
-	float degrees = std::stoi(rawCoord, &sz) / 100;
+	float degrees = ((int) rawCoord) / 100;
 
 	/* Get minutes, eg: rawCoord = 4532.5103 => 32 */
-	float minutes = (((float) (std::stoi(rawCoord, &sz))) / 100);  //45.32
+	float minutes = rawCoord / 100;  //45.32
 	minutes = (minutes - (long) minutes) * 100; // .32 * 100 = 32
 
 	/* Get seconds, eg: rawCoord = 4532.5103 => 51.03 */
-	float seconds = std::stof(rawCoord, &sz); // 4532.5103
-	seconds = seconds - (long) seconds; // .5103
+	float seconds = rawCoord - (long) rawCoord; // 4532.5103 -> .5103
 	seconds *= 100; // .5103 * 100 = 51.03
 
 	/**
@@ -159,86 +169,102 @@ float convertRawCoords(string rawCoord, string cardinalDirection) {
 }
 
 /**
- * @brief Write Gps sensor data to the cloud
+ * @brief Get the first set of coordinates from a buffer of raw nmea strings
+ * @returns a struct with latitude and longitude float values in degrees
  */
-void parseGpsData(char* nmeaBuffer, int result) {
+gpsCoords getCoords(char* rawBuffer, int size) {
+	gpsCoords coords;
+	stringstream ss;
+	char buf[bufferLength];
 	vector<string> vecStr;
-	string strCloudComponent = "gpsv1";
-	string strCloudData;
-	string strLatitude;
-	string strLatitudeDir;
-	string strLongitude;
-	string strLongitudeDir;
-	string strGpsLine;
-	char c;
+	float rawLatitude;
+	string strRawLatitudeDir;
+	float rawLongitude;
+	string strRawLongitudeDir;
 
-	for (int i = 0; i < result; ++i) {
-		c = nmeaBuffer[i];
+	/* Copy raw buffer into string stream */
+	ss << rawBuffer;
 
-		/* We've reached the end of file or the end of line */
-		if (c == EOF || c == '\n') {
-			/* If end of file reached, exit for loop */
-			if (c == EOF)
-				break;
+	/* Read through string stream, get each line of data, and process it */
+	while (!ss.eof()) {
+		/* Get one line of data and copy it into buf */
+		ss.getline(buf, size);
 
-			/* if we have an empty line, just continue with next iteration of loop */
-			if (strGpsLine.empty())
-				continue;
+		/**
+		 * Split the nmea string by the comma delimiter, putting
+		 * each item into it's own element in the vector
+		 * Example string:
+		 *   $GPGGA,172410.000,4532.5103,N,12257.6936,W,1,7,0.99,74.9,M,-19.6,M,,*5F
+		 *   where:
+		 * 		$GPGGA 		- Global Positioning System Fix Data
+		 *		172410.000 	- Universal Time Coordinated (UTC) hhmmss.ss
+		 *		4532.5103 	- Latitude (Degree minutes and seconds)
+		 *		N 			- North or South (South adds negative to latitude, North is positive)
+		 *		12257.6936 	- Longitude (Degree minutes and seconds)
+		 *		W			- East or West (West adds negative to Longitude, East is positive)
+		 *		1			- GPS quality indicator - 1: gps fix
+		 *		7			- Number of satelites in view
+		 *		0.99		- Horizontal dillution of precision (meters)
+		 *		74.9		- GPS antenna above/below mean-sea-level (geoid) (in meters)
+		 *		M			- Units of antenna altitude, meters
+		 *		-19.6		- Geoidal separation "-" is mean-sea-level below ellipsoid
+		 *		M			- Units of Geoidal separation, meters
+		 *		N/A			- Age of differential gps data
+		 *		N/A			- Differential reference staion ID 0000-1023
+		 *		*5F			- Checksum
+		 */
+		vecStr = split(buf, ',');
+
+		/* We're only interested in the first $GPGGA entry */
+		if (vecStr[0] == "$GPGGA") {
+			/**
+			 * Copy the latitude and longitude strings
+			 * into floats if they aren't empty
+			 */
+
+			/* Latitude */
+			if (!vecStr[2].empty())
+				rawLatitude = stof(vecStr[2]);
+			else
+				rawLatitude = 0.0f;
+
+			/* Latitude cardinal direction */
+			strRawLatitudeDir = vecStr[3];
+
+			/* Longitude */
+			if (!vecStr[4].empty())
+				rawLongitude = stof(vecStr[4]);
+			else
+				rawLongitude = 0.0f;
+
+			/* Longitude cardinal direction */
+			strRawLongitudeDir = vecStr[5];
 
 			/**
-			 * Split the nmea string by the comma delimiter, putting
-			 * each item into it's own element in the vector
-			 * Example string:
-			 *   $GPGGA,172410.000,4532.5103,N,12257.6936,W,1,7,0.99,74.9,M,-19.6,M,,*5F
-			 *   where:
-			 * 		$GPGGA 		- Global Positioning System Fix Data
-			 *		172410.000 	- Universal Time Coordinated (UTC) hhmmss.ss
-			 *		4532.5103 	- Latitude (Degree minutes and seconds)
-			 *		N 			- North or South (South adds negative to latitude, North is positive)
-			 *		12257.6936 	- Longitude (Degree minutes and seconds)
-			 *		W			- East or West (West adds negative to Longitude, East is positive)
-			 *		1			- GPS quality indicator - 1: gps fix
-			 *		7			- Number of satelites in view
-			 *		0.99		- Horizontal dillution of precision (meters)
-			 *		74.9		- GPS antenna above/below mean-sea-level (geoid) (in meters)
-			 *		M			- Units of antenna altitude, meters
-			 *		-19.6		- Geoidal separation "-" is mean-sea-level below ellipsoid
-			 *		M			- Units of Geoidal separation, meters
-			 *		N/A			- Age of differential gps data
-			 *		N/A			- Differential reference staion ID 0000-1023
-			 *		*5F			- Checksum
+			 * Convert raw latitude/longitude data to degree.fraction
+			 *  coordinates, eg. 45.2345
 			 */
-			vecStr = split(strGpsLine, ',');
-
-			/* We're only interested in the $GPGGA entries */
-			if (vecStr[0] == "$GPGGA") {
-				strCloudData = "";
-				strLatitude = vecStr[2]; /* Latitude */
-				strLatitudeDir = vecStr[3]; /* Cardinal direction */
-				strLongitude = vecStr[4]; /* Longitude */
-				strLongitudeDir = vecStr[5]; /* Cardinal direction */
-
-				/* Convert raw latitude/longitude data to degree coordinates, eg. 45.2345 */
-				strCloudData += to_string(convertRawCoords(strLatitude, strLatitudeDir));
-				strCloudData += ", ";
-				strCloudData += to_string(convertRawCoords(strLongitude, strLongitudeDir));
-				writeDataToCloud(strCloudComponent, strCloudData);
-			}
-			/* Clear contents of string */
-			strGpsLine.clear();
-			break; /* Break, we just want one GPGGA string from the group of data */
-		} else {
-			/* Add the character to the string */
-			strGpsLine += nmeaBuffer[i];
+			coords.latitude = convertRawCoords(rawLatitude, strRawLatitudeDir);
+			coords.longitude = convertRawCoords(rawLongitude,
+					strRawLongitudeDir);
 		}
+		memset(buf, 0, bufferLength);
+		vecStr.clear();
+		break; /* Break, we just want one GPGGA string from the group of data */
 	}
+	ss.str("");
+	return coords;
 }
 
 /**
- * @brief ublox6 GPS sensor - get GPS data from sensor
+ * @brief ublox6 GPS sensor - get GPS data from sensor, convert raw coords, and
+ * write data to cloud
  */
 void getGpsData(upm::Ublox6* gps) {
 	char nmeaBuffer[bufferLength];
+	string strCloudComponent = "gpsv1";
+	string strCloudData;
+	gpsCoords coords;
 
 	/* Make sure port is initialized properly.  9600 baud is the default. */
 	if (!gps->setupTty(B9600)) {
@@ -264,8 +290,19 @@ void getGpsData(upm::Ublox6* gps) {
 
 			/* Result will be non-zero if we have acquired data from sensor */
 			if (result > 0) {
+				/**
+				 * Get latitude and longitude coordinates in degree.fraction
+				 * format from the raw nmea GPGGA strings
+				 * */
+				coords = getCoords(nmeaBuffer, result);
+
+				/* Make a string from our float coords to send to the cloud */
+				strCloudData = to_string(coords.latitude);
+				strCloudData += ", ";
+				strCloudData += to_string(coords.longitude);
+
 				/* Write Gps sensor data to the cloud */
-				parseGpsData(nmeaBuffer, result);
+				writeDataToCloud(strCloudComponent, strCloudData);
 			}
 
 			if (result < 0) {
@@ -273,14 +310,18 @@ void getGpsData(upm::Ublox6* gps) {
 				cerr << "Port read error." << endl;
 				break;
 			}
+			strCloudData.clear();
+			memset(nmeaBuffer, 0, bufferLength);
 			continue;
 		}
-		usleep(10000000); // 10 secs
+		//usleep(10000000); // 10 secs
+		usleep(3000000); // 10 secs
 	}
 }
 
 /**
- * @brief Distance interrupter check - mounted on rear bumper of vehicle to check if close to an object when backing up
+ * @brief Distance interrupter check - mounted on rear bumper of vehicle to
+ * check if close to an object when backing up
  */
 void backupDistanceChecker(upm::RFR359F* distanceInterrupter,
 		upm::Jhd1313m1* lcd) {
@@ -306,7 +347,8 @@ void backupDistanceChecker(upm::RFR359F* distanceInterrupter,
 }
 
 /**
- * @brief Reflective sensor check - used to check if the tailgate of the vehicle is open
+ * @brief Reflective sensor check - used to check if the tailgate of the
+ * vehicle is open
  */
 void tailgateChecker(upm::RPR220* reflectiveSensor, upm::GroveLed* led) {
 	bool writeOnce = true;
@@ -381,9 +423,8 @@ int main(int argc, char **argv) {
 	thread threadGetGpsData(getGpsData, gps);
 	thread threadBackupDistanceChecker(backupDistanceChecker,
 			distanceInterruptor, lcd);
-	thread 	threadTailgateChecker(tailgateChecker, reflectiveSensor, led);
+	thread threadTailgateChecker(tailgateChecker, reflectiveSensor, led);
 	thread threadDisplayTime(displayTime, lcd);
-
 
 	/**
 	 * Program is running now after the thread create and will not execute the
@@ -392,7 +433,6 @@ int main(int argc, char **argv) {
 	 * When running in the terminal, press ctrl-c to exit threads and stop program
 	 * In Eclipse, click the red square terminate button in the Console window toolbar
 	 */
-
 
 	/* Join threads */
 	threadGetGpsData.join();
